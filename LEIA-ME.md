@@ -7,7 +7,7 @@
 3. Importe ou copie as seis linhas nas variáveis de ambiente da hospedagem. Deixe `COOKIE_SECURE=true` para usar pelo domínio HTTPS.
 4. Ajuste `SUBDOMAIN` em `squarecloud.app` para um nome disponível. Envie os arquivos do ZIP na raiz da aplicação. A hospedagem deve instalar `requirements.txt` e executar `python app.py` com Python 3.10+.
 5. Abra o domínio HTTPS e entre com a senha do painel. Em **Conexão da conta**, informe seu telefone com DDI, o código enviado pelo Telegram e, quando solicitada, sua senha de duas etapas.
-6. Clique em **Atualizar lista**, depois em **Selecionar todos** (ou escolha individualmente). Cole o texto e clique em **Revisar envio**. Confira os destinos e confirme.
+6. Ao conectar, o painel busca automaticamente grupos, canais e tópicos, incluindo arquivados. Aguarde a conclusão, confira a lista preenchida, cole o texto e clique em **Revisar envio**. Confirme para enviar. Você também pode copiar ou baixar os links disponíveis.
 
 O domínio web e a disponibilidade contínua dependem do seu plano. A implantação no SquareCloud não foi feita nesta sessão. Se a plataforma fornecer uma porta específica, use esse valor em `PORT`.
 

@@ -11,7 +11,7 @@ from telethon.tl.custom import ParticipantPermissions
 
 from app import create_app
 from service import TelegramService, PanelError, eligible_type, writable
-from fakes import FakeTelegram, channel
+from fakes import FakeTelegram, channel, topic
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -142,6 +142,110 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         creator = channel(22, 'Canal do dono', broadcast=True, allowed=False, creator=True)
         self.assertTrue(await writable(self.client, creator))
 
+    async def test_restore_starts_scan_without_manual_destinations(self):
+        await self.svc.restore()
+        self.assertIsNotNone(self.svc.scan_task)
+        await self.svc.scan_task
+        self.assertEqual(self.svc.scan_info['status'], 'completed')
+        self.assertEqual(self.client.dialog_folders, [0, 1])
+        self.assertEqual(len(self.svc.destinations), 3)
+        self.assertEqual(self.client.sent, [])
+
+    async def test_archived_groups_channels_topics_and_links(self):
+        public = channel(81, 'Canal arquivado', broadcast=True)
+        public.username = 'canal_teste'
+        forum = channel(80, 'Comunidade arquivada')
+        forum.forum = True
+        self.client.archived = [public, forum, self.client.entities[2]]
+        self.client.topics[80] = [topic(1, 'Geral'), topic(10, 'Boas-vindas'),
+                                  topic(20, 'Fechado', closed=True), topic(30, 'Oculto', hidden=True)]
+        self.client.topic_page_size = 2
+        result = await self.svc.scan()
+        entries = result['destinations']
+        self.assertEqual(len(entries), 6)  # Existing 3 + archived channel + 2 open topics.
+        self.assertEqual(self.client.dialog_folders, [0, 1])
+        targets = {x['title']: x for x in entries}
+        self.assertTrue(targets['Comunidade arquivada / Geral']['archived'])
+        self.assertEqual(targets['Comunidade arquivada / Boas-vindas']['topic_id'], 10)
+        self.assertEqual(targets['Comunidade arquivada / Boas-vindas']['link'], 'https://t.me/c/80/10')
+        self.assertEqual(targets['Canal arquivado']['link'], 'https://t.me/canal_teste')
+        self.assertEqual(len(self.client.topic_requests), 2)
+        self.assertEqual(result['scan']['checked_topics'], 4)
+        self.assertNotIn('Comunidade arquivada / Fechado', targets)
+        self.assertNotIn('Comunidade arquivada / Oculto', targets)
+        self.assertEqual(self.client.sent, [])
+
+    async def test_topic_pagination_over_one_hundred(self):
+        forum = channel(80, 'Forum grande')
+        forum.forum = True
+        self.client.archived = [forum]
+        self.client.topics[80] = [topic(i, 'Topico '+str(i)) for i in range(1, 106)]
+        result = await self.svc.scan()
+        self.assertEqual(result['scan']['checked_topics'], 105)
+        self.assertEqual(len(result['destinations']), 108)
+        self.assertEqual(len(self.client.topic_requests), 2)
+        self.assertEqual(self.client.topic_requests[1].offset_topic, 100)
+
+    async def test_repeated_topic_page_is_not_reported_as_complete(self):
+        forum = channel(80, 'Forum repetido')
+        forum.forum = True
+        self.client.archived = [forum]
+        self.client.topics[80] = [topic(i, 'Topico '+str(i)) for i in range(1, 4)]
+        original = type(self.client).__call__
+        from telethon import functions
+        class RepeatingClient(FakeTelegram):
+            async def __call__(client, request):
+                if isinstance(request, functions.messages.GetForumTopicsRequest):
+                    request.offset_topic = 0
+                    client.topic_page_size = 2
+                return await original(client, request)
+        self.client.__class__ = RepeatingClient
+        result = await self.svc.scan()
+        self.assertEqual(result['scan']['status'], 'partial')
+        self.assertEqual(len(result['scan']['warnings']), 1)
+        self.assertEqual(result['scan']['checked_topics'], 2)
+
+
+    async def test_topic_reply_routing_and_closed_topic_recheck(self):
+        forum = channel(80, 'Forum')
+        forum.forum = True
+        self.client.archived = [forum]
+        self.client.topics[80] = [topic(1, 'Geral'), topic(10, 'Boas-vindas')]
+        await self.svc.scan()
+        ids = [d['id'] for d in self.svc.destinations.values() if d['topic_id']]
+        draft = await self.svc.prepare('No topico certo', ids)
+        await self.svc.start(draft['ticket'])
+        await self.svc.task
+        self.assertEqual(len(self.client.sent), 2)
+        self.assertIsNone(self.client.sent[0].reply_to)
+        self.assertEqual(self.client.sent[1].reply_to.top_msg_id, 10)
+        self.client.sent.clear()
+        self.client.topics[80][1].closed = True
+        draft = await self.svc.prepare('Depois de fechar', ids)
+        await self.svc.start(draft['ticket'])
+        await self.svc.task
+        self.assertEqual(len(self.client.sent), 1)
+        self.assertEqual(self.svc.job['items'][1]['status'], 'skipped')
+
+    async def test_existing_invite_used_without_creating_one(self):
+        invite = types.ChatInviteExported(link='https://t.me/+convite_de_teste', admin_id=1234,
+                                          date=datetime.now(timezone.utc))
+        self.client.invites[1] = invite
+        result = await self.svc.scan()
+        entry = next(d for d in result['destinations'] if d['peer_id'] == '-1')
+        self.assertEqual(entry['link'], invite.link)
+        self.assertEqual(entry['link_kind'], 'invite')
+        self.assertEqual(self.client.sent, [])
+
+    async def test_flood_during_scan_reports_partial_and_blocks_send(self):
+        self.client.scan_failure = errors.FloodWaitError(None, 120)
+        result = await self.svc.scan()
+        self.assertEqual(result['scan']['status'], 'partial')
+        self.assertEqual(len(result['destinations']), 3)
+        with self.assertRaises(PanelError):
+            await self.svc.prepare('Nao enviar durante pausa', list(self.svc.destinations))
+
+
 
 class ApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -182,7 +286,9 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 200, await response.text())
             return await response.json()
         await post('restore', {})
-        scanned = await post('scan', {})
+        await post('scan', {})
+        await self.service.scan_task
+        scanned = await self.service.status()
         draft = await post('prepare', {'message': 'Teste de ponta a ponta', 'ids': [x['id'] for x in scanned['destinations']]})
         forbidden = await self.client.post('/api/start', json={'ticket': draft['ticket']}, headers=self.headers)
         self.assertEqual(forbidden.status, 400)

@@ -129,7 +129,9 @@ def create_app(service, password, secure=True):
                 raise PanelError('Digite sua senha de duas etapas.')
             result = await service.verify(password=pwd)
         elif name == 'scan':
-            result = await service.scan()
+            result = await service.start_scan()
+        elif name == 'cancel-scan':
+            result = await service.cancel_scan()
         elif name == 'prepare':
             result = await service.prepare(body.get('message'), body.get('ids'))
         elif name == 'start':

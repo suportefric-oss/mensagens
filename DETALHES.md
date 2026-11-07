@@ -8,9 +8,17 @@ O painel usa a API de usuário por meio do Telethon. Você precisa de `api_id` e
 
 - Grupos comuns e supergrupos públicos ou privados onde a conta pode enviar texto.
 - Canais públicos ou privados onde a conta é dona ou tem permissão de publicar.
+- Tópicos como Geral, Boas-vindas e outros: são enumerados com paginação e tratados como destinos separados, respeitando permissões do grupo e o estado do tópico.
+- A varredura começa automaticamente ao conectar ou restaurar a sessão. Lista principal e arquivados são consultados explicitamente, sem cadastrar IDs ou links. Ao terminar sem avisos, todos os destinos encontrados ficam selecionados; você pode desmarcar qualquer um. Nenhuma mensagem é enviada sem a confirmação final.
 - Conversas individuais, bots no privado e Mensagens Salvas são excluídos no servidor, inclusive na etapa de envio.
 
-O painel não entra em grupos, não obtém listas de membros e não lê mensagens dos grupos. Ele consulta seus diálogos e permissões. Em grupos com tópicos, envia ao destino geral; não percorre cada tópico. Se o tópico geral estiver fechado, o Telegram pode recusar o envio. Permissões podem mudar entre a atualização e o envio; cada destino é verificado novamente e erros aparecem em Atividade. Os envios são reais, pela conta conectada. Publique de acordo com as regras dos grupos e canais.
+O painel não entra em grupos nem analisa o conteúdo das conversas. Ele consulta diálogos, permissões, metadados de tópicos e informações necessárias para obter links existentes. Tópicos ocultos são excluídos; fechados só entram para dono ou administrador com permissão de gerenciar tópicos. A consulta de permissões não garante entrega: o Telegram decide a permissão final, inclusive para restrições específicas. Permissões e estado dos tópicos são verificados novamente antes de cada envio, que é direcionado ao tópico correspondente. Os envios são reais, pela conta conectada. Publique de acordo com as regras dos grupos e canais.
+
+## Links e andamento da varredura
+
+O painel exibe o progresso e informa quando a consulta está incompleta, por exemplo, por falha de rede ou pausa do Telegram. Não apresenta uma varredura parcial como completa. Se houver avisos, confira a lista antes de selecionar e enviar. É possível parar a varredura e atualizar novamente depois. Restaurar uma sessão pode reutilizar uma varredura concluída nos últimos cinco minutos para evitar consultas repetidas.
+
+Links públicos usam o nome de usuário do grupo/canal. Para grupos privados, usa somente convites existentes retornados pelo Telegram, quando disponíveis à sua conta; nenhum convite é criado. Tópicos privados têm links internos que funcionam para membros. Se não houver um link disponível, o destino continua listado com essa indicação. Copiar/baixar links inclui todos os destinos com links disponíveis, independentemente da seleção. Convites privados são sensíveis: compartilhe apenas com quem deve entrar.
 
 ## Controles
 

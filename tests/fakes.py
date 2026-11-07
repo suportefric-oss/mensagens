@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 from datetime import datetime, timezone
-from telethon import types, utils, errors
+from telethon import types, utils, errors, functions
 from telethon.tl.custom import ParticipantPermissions
 
 
@@ -27,6 +27,13 @@ class FakeTelegram:
         self.require_2fa = False
         self.permissions = {}
         self.requested_code = False
+        self.archived = []
+        self.dialog_folders = []
+        self.topics = {}
+        self.topic_requests = []
+        self.topic_page_size = 100
+        self.invites = {}
+        self.scan_failure = None
 
     def is_connected(self):
         return self.connected
@@ -57,8 +64,11 @@ class FakeTelegram:
         self.authenticated = False
         return True
 
-    async def iter_dialogs(self):
-        for entity in self.entities:
+    async def iter_dialogs(self, folder=0, ignore_migrated=True):
+        self.dialog_folders.append(folder)
+        if folder == 1 and self.scan_failure:
+            raise self.scan_failure
+        for entity in (self.archived if folder == 1 else self.entities):
             yield SimpleNamespace(entity=entity, name=getattr(entity, 'title', 'privado'))
 
     async def get_permissions(self, entity, who):
@@ -75,15 +85,38 @@ class FakeTelegram:
         return ParticipantPermissions(part, isinstance(entity, types.Chat))
 
     async def get_entity(self, peer_id):
-        return next(e for e in self.entities if utils.get_peer_id(e) == peer_id)
+        return next(e for e in self.entities + self.archived if utils.get_peer_id(e) == peer_id)
 
     async def get_input_entity(self, entity):
         return entity
 
     async def __call__(self, request):
+        if isinstance(request, functions.messages.GetFullChatRequest):
+            return SimpleNamespace(full_chat=SimpleNamespace(exported_invite=self.invites.get(request.chat_id)))
+        if isinstance(request, functions.channels.GetFullChannelRequest):
+            return SimpleNamespace(full_chat=SimpleNamespace(exported_invite=self.invites.get(request.channel.id)))
+        if isinstance(request, functions.messages.GetForumTopicsRequest):
+            self.topic_requests.append(request)
+            all_topics = self.topics.get(request.peer.id, [])
+            start = next((i+1 for i,t in enumerate(all_topics) if t.id == request.offset_topic), 0)
+            batch = all_topics[start:start+min(request.limit, self.topic_page_size)]
+            return SimpleNamespace(topics=batch, count=len(all_topics),
+                                   messages=[SimpleNamespace(id=t.top_message, date=t.date) for t in batch],
+                                   order_by_create_date=False)
+        if isinstance(request, functions.messages.GetForumTopicsByIDRequest):
+            return SimpleNamespace(topics=[t for t in self.topics.get(request.peer.id, []) if t.id in request.topics])
         if self.failures:
             failure = self.failures.pop(0)
             if failure:
                 raise failure
         self.sent.append(request)
         return True
+
+
+def topic(id, title, closed=False, hidden=False):
+    return types.ForumTopic(id=id, date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                           peer=types.PeerChannel(80), title=title, icon_color=0,
+                           top_message=id+1000, read_inbox_max_id=0, read_outbox_max_id=0,
+                           unread_count=0, unread_mentions_count=0, unread_reactions_count=0,
+                           unread_poll_votes_count=0, from_id=types.PeerUser(1234),
+                           notify_settings=types.PeerNotifySettings(), closed=closed, hidden=hidden)

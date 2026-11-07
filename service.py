@@ -41,6 +41,18 @@ async def writable(client, entity):
         getattr(rights.participant, 'banned_rights', None))
 
 
+def topic_writable(entity, topic):
+    # Group membership alone does not imply permission to post in a closed topic.
+    can_manage = bool(getattr(entity, 'creator', False) or
+                      getattr(getattr(entity, 'admin_rights', None), 'manage_topics', False))
+    return isinstance(topic, types.ForumTopic) and not topic.hidden and (not topic.closed or can_manage)
+
+
+def public_username(entity):
+    return getattr(entity, 'username', None) or next(
+        (u.username for u in (getattr(entity, 'usernames', None) or []) if u.active), None)
+
+
 class PanelError(Exception):
     pass
 
@@ -56,6 +68,9 @@ class TelegramService:
         self.interval = max(5, interval)
         self.destinations = {}
         self.scan_time = None
+        self.scan_task = None
+        self.scan_info = {'id': None, 'status': 'idle', 'checked_dialogs': 0, 'checked_topics': 0,
+                          'destinations_found': 0, 'warnings': [], 'note': '', 'wait_until': 0}
         self.phone = None
         self.code_hash = None
         self.pending_since = 0
@@ -111,6 +126,7 @@ class TelegramService:
                 'account': {'name': utils.get_display_name(self.me), 'username': self.me.username} if connected else None,
                 'login_stage': self.login_stage,
                 'destinations': list(self.destinations.values()), 'scan_time': self.scan_time,
+                'scan': dict(self.scan_info),
                 'interval': self.interval, 'job': self.job}
 
     async def restore(self):
@@ -118,6 +134,7 @@ class TelegramService:
             if await self.authorized():
                 self.me = await self.client.get_me()
                 self.login_stage = 'connected'
+                self.schedule_scan(automatic=True)
             return await self.status()
 
     async def request_code(self, phone):
@@ -128,6 +145,7 @@ class TelegramService:
             if await self.client.is_user_authorized():
                 self.me = await self.client.get_me()
                 self.login_stage = 'connected'
+                self.schedule_scan(automatic=True)
                 return {'stage': 'connected'}
             if self.pending_since and time.time() - self.pending_since < 60:
                 raise PanelError('Aguarde um minuto antes de pedir outro código.')
@@ -157,35 +175,179 @@ class TelegramService:
             self.pending_since = 0
             self.me = await self.client.get_me()
             self.login_stage = 'connected'
+            self.schedule_scan(automatic=True)
             return {'stage': 'connected'}
 
-    async def scan(self):
+    def schedule_scan(self, automatic=False):
+        if self.scan_task and not self.scan_task.done():
+            return
+        if self.job and self.job['status'] in ACTIVE:
+            if automatic:
+                return
+            raise PanelError('Aguarde ou pare o envio antes de atualizar os destinos.')
+        if self.scan_info.get('wait_until', 0) > time.time():
+            if automatic:
+                return
+            raise PanelError('Aguarde a pausa da varredura solicitada pelo Telegram.')
+        if automatic and self.scan_time and time.time() - self.scan_time < 300:
+            return
+        self.scan_info = {'id': secrets.token_hex(8), 'status': 'running', 'checked_dialogs': 0,
+                          'checked_topics': 0, 'destinations_found': 0, 'warnings': [],
+                          'note': 'Verificando a lista principal e os arquivados…', 'wait_until': 0}
+        self.destinations = {}
+        self.scan_time = None
+        self.ticket = None
+        self.scan_task = asyncio.create_task(self.run_scan())
+
+    def scan_result(self):
+        return {'destinations': list(self.destinations.values()), 'scan_time': self.scan_time,
+                'scan': dict(self.scan_info)}
+
+    async def start_scan(self):
         async with self.lock:
             await self.require_account()
-            if self.job and self.job['status'] in ACTIVE:
-                raise PanelError('Aguarde ou pare o envio antes de atualizar os destinos.')
-            found = {}
-            async for dialog in self.client.iter_dialogs():
-                entity = dialog.entity
-                if not eligible_type(entity):
-                    continue
-                try:
-                    allowed = await writable(self.client, entity)
-                except errors.FloodWaitError:
-                    raise
-                except errors.RPCError:
-                    continue
-                if allowed:
-                    peer_id = str(utils.get_peer_id(entity))
-                    found[peer_id] = {'id': peer_id, 'title': dialog.name,
-                                     'kind': 'channel' if getattr(entity, 'broadcast', False) else 'group',
-                                     'visibility': 'Público' if getattr(entity, 'username', None) else 'Privado'}
-            self.destinations = found
-            self.scan_time = time.time()
-            self.ticket = None
-            return {'destinations': list(found.values()), 'scan_time': self.scan_time}
+            self.schedule_scan()
+            return self.scan_result()
+
+    async def scan(self):
+        # Awaitable helper used by local tests. Web requests use start_scan and poll progress.
+        await self.start_scan()
+        if self.scan_task:
+            await self.scan_task
+        return self.scan_result()
+
+    def scan_warning(self, title, message):
+        self.scan_info['warnings'].append({'title': title, 'message': message})
+
+    async def existing_group_link(self, entity):
+        username = public_username(entity)
+        if username:
+            return 'https://t.me/' + username
+        try:
+            if isinstance(entity, types.Channel):
+                full = await self.client(functions.channels.GetFullChannelRequest(channel=entity))
+            else:
+                full = await self.client(functions.messages.GetFullChatRequest(chat_id=entity.id))
+            invite = getattr(full.full_chat, 'exported_invite', None)
+            if isinstance(invite, types.ChatInviteExported) and not invite.revoked:
+                expires = getattr(invite, 'expire_date', None)
+                limited = invite.usage_limit and (invite.usage or 0) >= invite.usage_limit
+                if not limited and (not expires or expires.timestamp() > time.time()):
+                    return invite.link
+        except (errors.FloodWaitError, errors.SlowModeWaitError):
+            raise
+        except errors.RPCError:
+            # Missing invite permission does not make a writable destination ineligible.
+            pass
+        return None
+
+    async def forum_topics(self, entity):
+        offset_date, offset_id, offset_topic = None, 0, 0
+        seen, cursors = set(), set()
+        while True:
+            result = await self.client(functions.messages.GetForumTopicsRequest(
+                peer=await self.client.get_input_entity(entity), offset_date=offset_date,
+                offset_id=offset_id, offset_topic=offset_topic, limit=100))
+            topics = [t for t in result.topics if isinstance(t, types.ForumTopic)]
+            if not result.topics:
+                break
+            new = [t for t in topics if t.id not in seen]
+            for topic in new:
+                seen.add(topic.id)
+                self.scan_info['checked_topics'] += 1
+                yield topic
+            if not new:
+                self.scan_warning(entity.title, 'Telegram repetiu tópicos sem avançar; a lista pode estar incompleta.')
+                break
+            if len(seen) >= result.count:
+                break
+            last = topics[-1]
+            messages = {m.id: m for m in result.messages}
+            offset_date = last.date if result.order_by_create_date else getattr(
+                messages.get(last.top_message), 'date', last.date)
+            offset_id, offset_topic = last.top_message, last.id
+            cursor = (str(offset_date), offset_id, offset_topic)
+            if cursor in cursors:
+                self.scan_warning(entity.title, 'Telegram repetiu a página de tópicos; a lista pode estar incompleta.')
+                break
+            cursors.add(cursor)
+
+    def add_destination(self, entity, title, archived, group_link, topic=None):
+        peer_id = str(utils.get_peer_id(entity))
+        topic_id = topic.id if topic else None
+        username = public_username(entity)
+        link = group_link
+        if topic:
+            link = ('https://t.me/' + username if username else 'https://t.me/c/' + str(entity.id)) + '/' + str(topic.id)
+        entry = {'id': peer_id + (':' + str(topic_id) if topic else ''), 'peer_id': peer_id,
+                 'topic_id': topic_id, 'title': title + (' / ' + topic.title if topic else ''),
+                 'group_title': title, 'topic_title': topic.title if topic else None,
+                 'kind': 'channel' if getattr(entity, 'broadcast', False) else 'group',
+                 'visibility': 'Público' if username else 'Privado', 'archived': archived,
+                 'link': link, 'group_link': group_link,
+                 'link_kind': ('public' if username else 'internal' if topic else 'invite') if link else None}
+        self.destinations[entry['id']] = entry
+        self.scan_info['destinations_found'] = len(self.destinations)
+
+    async def run_scan(self):
+        async with self.lock:
+            try:
+                await self.require_account()
+                seen = set()
+                # Telegram folder 0 = main list, 1 = archive. Do not rely on folder defaults.
+                for folder in (0, 1):
+                    self.scan_info['note'] = 'Verificando ' + ('arquivados…' if folder else 'lista principal…')
+                    async for dialog in self.client.iter_dialogs(folder=folder, ignore_migrated=True):
+                        entity = dialog.entity
+                        peer_id = utils.get_peer_id(entity)
+                        if peer_id in seen:
+                            continue
+                        seen.add(peer_id)
+                        self.scan_info['checked_dialogs'] += 1
+                        if not eligible_type(entity):
+                            continue
+                        try:
+                            if not await writable(self.client, entity):
+                                continue
+                            group_link = await self.existing_group_link(entity)
+                            if isinstance(entity, types.Channel) and entity.forum:
+                                async for topic in self.forum_topics(entity):
+                                    if topic_writable(entity, topic):
+                                        self.add_destination(entity, dialog.name, folder == 1, group_link, topic)
+                            else:
+                                self.add_destination(entity, dialog.name, folder == 1, group_link)
+                        except (errors.FloodWaitError, errors.SlowModeWaitError):
+                            raise
+                        except errors.RPCError as exc:
+                            self.scan_warning(dialog.name, 'Não foi possível verificar: ' + type(exc).__name__)
+                self.scan_time = time.time()
+                warnings = self.scan_info['warnings']
+                self.scan_info['status'] = 'partial' if warnings else 'completed'
+                self.scan_info['note'] = ('Varredura concluída com avisos. Confira os itens não verificados.' if warnings else
+                                          'Varredura completa: lista principal, arquivados e tópicos verificados.')
+            except (errors.FloodWaitError, errors.SlowModeWaitError) as exc:
+                self.scan_info.update(status='partial', wait_until=time.time()+exc.seconds,
+                                      note=f'Varredura incompleta: Telegram pediu uma pausa de {exc.seconds}s. Atualize após o prazo.')
+            except asyncio.CancelledError:
+                self.scan_info.update(status='cancelled', note='Varredura interrompida. A lista pode estar incompleta.')
+                raise
+            except Exception:
+                self.scan_info.update(status='error', note='Varredura incompleta. Confira a conexão e atualize a lista.')
+
+    async def cancel_scan(self):
+        if self.scan_task and not self.scan_task.done():
+            self.scan_task.cancel()
+            try:
+                await self.scan_task
+            except asyncio.CancelledError:
+                pass
+        if self.scan_info['status'] == 'running':
+            self.scan_info.update(status='cancelled', note='Varredura interrompida. A lista pode estar incompleta.')
+        return self.scan_result()
 
     def check_wait(self):
+        if self.scan_info.get('wait_until', 0) > time.time():
+            raise PanelError('Aguarde a pausa solicitada pelo Telegram durante a varredura.')
         if self.job and self.job.get('wait_until', 0) > time.time():
             raise PanelError('Aguarde o prazo de pausa informado pelo Telegram antes de enviar novamente.')
 
@@ -249,7 +411,7 @@ class TelegramService:
                 if item['status'] != 'pending':
                     continue
                 try:
-                    entity = await self.client.get_entity(int(item['id']))
+                    entity = await self.client.get_entity(int(item.get('peer_id', item['id'])))
                     if not await writable(self.client, entity):
                         item.update(status='skipped', detail='Sem permissão para publicar neste destino.')
                         self.save()
@@ -257,6 +419,15 @@ class TelegramService:
                     # A second type check prevents any user peer from entering the send path.
                     if not eligible_type(entity):
                         raise PanelError('Conversa individual bloqueada.')
+                    topic_id = item.get('topic_id')
+                    if topic_id is not None:
+                        topics = await self.client(functions.messages.GetForumTopicsByIDRequest(
+                            peer=await self.client.get_input_entity(entity), topics=[topic_id]))
+                        topic = next((t for t in topics.topics if getattr(t, 'id', None) == topic_id), None)
+                        if not entity.forum or not topic_writable(entity, topic):
+                            item.update(status='skipped', detail='Tópico fechado, oculto ou indisponível.')
+                            self.save()
+                            continue
                     if self.stop.is_set():
                         break
                     item['status'] = 'sending'
@@ -265,7 +436,9 @@ class TelegramService:
                     rid = int.from_bytes(secrets.token_bytes(8), 'little', signed=True)
                     await self.client(functions.messages.SendMessageRequest(
                         peer=await self.client.get_input_entity(entity), message=self.job['message'],
-                        random_id=rid, no_webpage=True))
+                        random_id=rid, no_webpage=True,
+                        reply_to=types.InputReplyToMessage(reply_to_msg_id=topic_id, top_msg_id=topic_id)
+                        if topic_id and topic_id != 1 else None))
                     item.update(status='sent', detail='Enviado', sent_at=time.time())
                 except (errors.FloodWaitError, errors.SlowModeWaitError) as exc:
                     item.update(status='pending', detail='Telegram pediu uma pausa.')
@@ -330,6 +503,7 @@ class TelegramService:
             return self.public_job()
 
     async def disconnect(self):
+        await self.cancel_scan()
         async with self.lock:
             await self.cancel()
             if self.task and not self.task.done():
@@ -342,6 +516,8 @@ class TelegramService:
             self.me = None
             self.destinations = {}
             self.scan_time = None
+            self.scan_info = {'id': None, 'status': 'idle', 'checked_dialogs': 0, 'checked_topics': 0,
+                              'destinations_found': 0, 'warnings': [], 'note': '', 'wait_until': 0}
             self.phone = self.code_hash = None
             self.pending_since = 0
             self.login_stage = 'phone'
@@ -349,6 +525,7 @@ class TelegramService:
             return {'ok': True}
 
     async def close(self):
+        await self.cancel_scan()
         if self.task and not self.task.done():
             self.task.cancel()
             try:
