@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 import time
+import unicodedata
 from pathlib import Path
 
 from telethon import TelegramClient, errors, functions, types, utils
@@ -11,7 +12,26 @@ from telethon import TelegramClient, errors, functions, types, utils
 ACTIVE = {'running', 'stopping'}
 
 
+def excluded_destination(entity=None, entry=None, topic=None):
+    """Exclude the requested source by title, aliases, topic name or destination link."""
+    values = []
+    if entity is not None:
+        values.extend([getattr(entity, 'title', ''), getattr(entity, 'username', '')])
+        values.extend(getattr(alias, 'username', '') for alias in (getattr(entity, 'usernames', None) or []))
+    if entry:
+        values.extend(entry.get(key, '') for key in ('title', 'group_title', 'topic_title', 'link', 'group_link'))
+    if topic is not None:
+        values.append(getattr(topic, 'title', ''))
+    for value in values:
+        normalized = ''.join(c for c in unicodedata.normalize('NFKD', str(value or '')).casefold() if c.isalnum())
+        if 'zenitrylogs' in normalized:
+            return True
+    return False
+
+
 def eligible_type(entity):
+    if excluded_destination(entity=entity):
+        return False
     if isinstance(entity, types.Chat):
         return not (entity.left or entity.deactivated or entity.migrated_to)
     return isinstance(entity, types.Channel) and not entity.left and bool(entity.megagroup or entity.broadcast)
@@ -45,7 +65,7 @@ def topic_writable(entity, topic):
     # Group membership alone does not imply permission to post in a closed topic.
     can_manage = bool(getattr(entity, 'creator', False) or
                       getattr(getattr(entity, 'admin_rights', None), 'manage_topics', False))
-    return isinstance(topic, types.ForumTopic) and not topic.hidden and (not topic.closed or can_manage)
+    return isinstance(topic, types.ForumTopic) and not excluded_destination(entity=entity, topic=topic) and not topic.hidden and (not topic.closed or can_manage)
 
 
 def public_username(entity):
@@ -77,6 +97,9 @@ class TelegramService:
         self.login_stage = 'phone'
         self.ticket = None
         self.job = json.loads(self.file.read_text()) if self.file.exists() else None
+        if self.job:
+            self.job['items'] = [item for item in self.job['items'] if not excluded_destination(entry=item)]
+            self.save()
         if self.job and self.job['status'] in ACTIVE:
             self.job['status'] = 'interrupted'
             self.job['note'] = 'Servidor reiniciado. Confira o histórico antes de continuar os pendentes.'
@@ -273,6 +296,8 @@ class TelegramService:
             cursors.add(cursor)
 
     def add_destination(self, entity, title, archived, group_link, topic=None):
+        if excluded_destination(entity=entity, topic=topic, entry={'title': title, 'group_link': group_link}):
+            return
         peer_id = str(utils.get_peer_id(entity))
         topic_id = topic.id if topic else None
         username = public_username(entity)
@@ -362,7 +387,7 @@ class TelegramService:
             if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
                 raise PanelError('Selecione pelo menos um destino.')
             ids = list(dict.fromkeys(ids))
-            if any(i not in self.destinations for i in ids):
+            if any(i not in self.destinations or excluded_destination(entry=self.destinations[i]) for i in ids):
                 raise PanelError('Destino inválido. Atualize a lista e selecione novamente.')
             self.ticket = {'token': secrets.token_urlsafe(32), 'expires': time.time()+300,
                            'message': message, 'items': [dict(self.destinations[i]) for i in ids],
@@ -381,6 +406,8 @@ class TelegramService:
             draft = self.ticket
             if not draft or draft['expires'] < time.time() or not secrets.compare_digest(draft['token'], ticket):
                 raise PanelError('Confirmação expirada. Revise a mensagem novamente.')
+            if any(excluded_destination(entry=item) for item in draft['items']):
+                raise PanelError('A revisão contém um destino excluído. Atualize a lista.')
             if me.id != draft['account_id']:
                 raise PanelError('A conta mudou. Atualize os destinos.')
             self.job = {'id': secrets.token_hex(12), 'ticket': ticket, 'account_id': me.id,
@@ -411,6 +438,10 @@ class TelegramService:
                 if item['status'] != 'pending':
                     continue
                 try:
+                    if excluded_destination(entry=item):
+                        item.update(status='skipped', detail='Destino excluído pelo dono do painel.')
+                        self.save()
+                        continue
                     entity = await self.client.get_entity(int(item.get('peer_id', item['id'])))
                     if not await writable(self.client, entity):
                         item.update(status='skipped', detail='Sem permissão para publicar neste destino.')

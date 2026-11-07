@@ -14,6 +14,10 @@ O painel usa a API de usuário por meio do Telethon. Você precisa de `api_id` e
 
 O painel não entra em grupos nem analisa o conteúdo das conversas. Ele consulta diálogos, permissões, metadados de tópicos e informações necessárias para obter links existentes. Tópicos ocultos são excluídos; fechados só entram para dono ou administrador com permissão de gerenciar tópicos. A consulta de permissões não garante entrega: o Telegram decide a permissão final, inclusive para restrições específicas. Permissões e estado dos tópicos são verificados novamente antes de cada envio, que é direcionado ao tópico correspondente. Os envios são reais, pela conta conectada. Publique de acordo com as regras dos grupos e canais.
 
+## Exclusão solicitada
+
+`zenitrylogs` é excluído por nome, nome de usuário, aliases, nome de tópico e links. A comparação ignora maiúsculas, acentos e separadores. A exclusão vale para lista principal, arquivados, links exportados e envio; também remove registros identificáveis dessa origem do último envio salvo ao reiniciar. O servidor verifica o destino novamente antes de publicar. Uma origem com nome e identificação totalmente diferentes não pode ser reconhecida apenas por esse texto.
+
 ## Links e andamento da varredura
 
 O painel exibe o progresso e informa quando a consulta está incompleta, por exemplo, por falha de rede ou pausa do Telegram. Não apresenta uma varredura parcial como completa. Se houver avisos, confira a lista antes de selecionar e enviar. É possível parar a varredura e atualizar novamente depois. Restaurar uma sessão pode reutilizar uma varredura concluída nos últimos cinco minutos para evitar consultas repetidas.

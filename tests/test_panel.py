@@ -10,7 +10,7 @@ from telethon import types, errors, utils
 from telethon.tl.custom import ParticipantPermissions
 
 from app import create_app
-from service import TelegramService, PanelError, eligible_type, writable
+from service import TelegramService, PanelError, eligible_type, writable, excluded_destination
 from fakes import FakeTelegram, channel, topic
 
 
@@ -244,6 +244,43 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result['destinations']), 3)
         with self.assertRaises(PanelError):
             await self.svc.prepare('Nao enviar durante pausa', list(self.svc.destinations))
+
+
+    async def test_zenitrylogs_excluded_from_main_archive_topics_and_links(self):
+        named = channel(91, 'Zenitry Logs - avisos', broadcast=True)
+        alias = channel(92, 'Outro nome')
+        alias.username = 'ZENITRYLOGS'
+        forum = channel(93, 'Forum permitido')
+        forum.forum = True
+        self.client.entities.append(named)
+        self.client.archived.extend([alias, forum])
+        self.client.topics[93] = [topic(1, 'Geral'), topic(10, 'ZenitryLogs novidades')]
+        self.client.invites[1] = types.ChatInviteExported(link='https://t.me/zenitrylogs', admin_id=1234, date=None)
+        result = await self.svc.scan()
+        self.assertEqual(result['scan']['status'], 'completed')
+        self.assertTrue(all(not excluded_destination(entry=d) for d in result['destinations']))
+        self.assertEqual(len(result['destinations']), 3)  # 2 allowed originals + forum general.
+        self.assertFalse(eligible_type(named))
+        self.assertFalse(eligible_type(alias))
+        self.assertNotIn('-1000000000091', self.svc.destinations)
+        self.assertEqual(self.client.sent, [])
+
+    async def test_renamed_destination_blocked_before_send(self):
+        draft = await self.prepare_all()
+        self.client.entities[2].title = 'ZENITRYLOGS'
+        await self.svc.start(draft['ticket'])
+        await self.svc.task
+        self.assertEqual(self.svc.job['items'][0]['status'], 'skipped')
+        self.assertEqual(len(self.client.sent), 2)
+
+    async def test_persisted_excluded_records_removed_on_restart(self):
+        self.svc.file.write_text(json.dumps({'status': 'paused', 'items': [
+            {'title': 'ZenitryLogs / Geral', 'status': 'pending'},
+            {'title': 'Equipe permitida', 'status': 'pending'}]}))
+        restored = TelegramService(self.tmp.name, 1, 'a'*32, client=self.client)
+        self.assertEqual(len(restored.job['items']), 1)
+        self.assertEqual(restored.job['items'][0]['title'], 'Equipe permitida')
+        self.assertNotIn('ZenitryLogs', self.svc.file.read_text())
 
 
 
